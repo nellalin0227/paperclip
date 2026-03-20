@@ -9,16 +9,19 @@ if [ -n "$CLAUDE_CREDENTIALS" ]; then
     printf '%s' "$CLAUDE_CREDENTIALS" > "$dir/.claude/.credentials.json"
     chmod 600 "$dir/.claude/.credentials.json"
     chown -R node:node "$dir/.claude"
-    echo "Claude credentials written to $dir/.claude/.credentials.json"
   done
+  echo "Claude credentials written"
+
+  # Try to refresh token by running claude as node user
+  echo "Attempting Claude token refresh..."
+  su -s /bin/sh node -c 'HOME=/paperclip claude --version' 2>&1 || true
+
+  # Show updated credentials (token may have been refreshed)
+  echo "Credentials after refresh attempt:"
+  su -s /bin/sh node -c 'cat /paperclip/.claude/.credentials.json' 2>&1 | head -1
 else
   echo "WARNING: CLAUDE_CREDENTIALS env var not set"
 fi
-
-# Debug: verify credentials exist
-echo "Checking credentials files:"
-ls -la /paperclip/.claude/.credentials.json 2>&1 || true
-ls -la /home/node/.claude/.credentials.json 2>&1 || true
 
 # Switch to node user and start
 exec su -s /bin/sh node -c 'HOME=/paperclip node --import ./server/node_modules/tsx/dist/loader.mjs server/dist/index.js'
