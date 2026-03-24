@@ -31,66 +31,110 @@ import {
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
 
 /**
- * Re-inject Claude credentials from CLAUDE_CREDENTIALS env var and trigger
- * a token refresh via `claude --version`. Returns true if refresh succeeded.
+ * Refresh Claude OAuth token by calling Anthropic's token endpoint directly
+ * with the refresh_token from credentials. Returns true if refresh succeeded.
  */
 async function refreshClaudeCredentials(
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>,
 ): Promise<boolean> {
-  const credJson = process.env.CLAUDE_CREDENTIALS;
-  if (!credJson) {
-    await onLog("stderr", "[paperclip] CLAUDE_CREDENTIALS env var not set, cannot refresh.\n");
+  const OAUTH_ENDPOINT = "https://console.anthropic.com/v1/oauth/token";
+  const CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+  const home = process.env.HOME || "/paperclip";
+  const credDirs = [home, "/home/node", "/paperclip", "/paperclip/workspace"];
+
+  // Find credentials file with a refresh token
+  let credPath: string | null = null;
+  let credData: Record<string, unknown> | null = null;
+  let refreshToken: string | null = null;
+
+  for (const dir of credDirs) {
+    const candidate = path.join(dir, ".claude", ".credentials.json");
+    try {
+      const raw = await fs.readFile(candidate, "utf-8");
+      const parsed = JSON.parse(raw) as Record<string, unknown>;
+      const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined;
+      if (oauth?.refreshToken && typeof oauth.refreshToken === "string") {
+        credPath = candidate;
+        credData = parsed;
+        refreshToken = oauth.refreshToken;
+        break;
+      }
+    } catch {
+      // Try next
+    }
+  }
+
+  // Fallback: try from env var
+  if (!refreshToken && process.env.CLAUDE_CREDENTIALS) {
+    try {
+      const parsed = JSON.parse(process.env.CLAUDE_CREDENTIALS) as Record<string, unknown>;
+      const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined;
+      if (oauth?.refreshToken && typeof oauth.refreshToken === "string") {
+        credData = parsed;
+        refreshToken = oauth.refreshToken;
+        credPath = path.join(home, ".claude", ".credentials.json");
+      }
+    } catch {
+      // Invalid JSON
+    }
+  }
+
+  if (!refreshToken || !credData) {
+    await onLog("stderr", "[paperclip] No refresh token found, cannot refresh OAuth token.\n");
     return false;
   }
 
-  // Write credentials to all HOME locations
-  const dirs = [
-    process.env.HOME || "/paperclip",
-    "/home/node",
-    "/paperclip",
-    "/paperclip/workspace",
-  ];
-  for (const dir of dirs) {
-    const claudeDir = path.join(dir, ".claude");
-    try {
-      await fs.mkdir(claudeDir, { recursive: true });
-      await fs.writeFile(path.join(claudeDir, ".credentials.json"), credJson, { mode: 0o600 });
-    } catch {
-      // Skip dirs we cannot write to
-    }
-  }
-
-  // Trigger token refresh via claude --version
+  // Call Anthropic OAuth endpoint
   try {
-    const { execFile } = await import("node:child_process");
-    const { promisify } = await import("node:util");
-    const execFileAsync = promisify(execFile);
-    await execFileAsync("claude", ["--version"], {
-      env: { ...process.env, HOME: process.env.HOME || "/paperclip" },
-      timeout: 15_000,
+    const response = await fetch(OAUTH_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        grant_type: "refresh_token",
+        refresh_token: refreshToken,
+        client_id: CLIENT_ID,
+      }),
     });
 
-    // Sync refreshed credentials from primary HOME to other locations
-    const primaryCred = path.join(process.env.HOME || "/paperclip", ".claude", ".credentials.json");
-    try {
-      const refreshedContent = await fs.readFile(primaryCred, "utf-8");
-      for (const dir of dirs) {
-        const target = path.join(dir, ".claude", ".credentials.json");
-        if (target !== primaryCred) {
-          try {
-            await fs.writeFile(target, refreshedContent, { mode: 0o600 });
-          } catch {
-            // Skip
-          }
-        }
-      }
-    } catch {
-      // Primary file read failed, skip sync
+    if (!response.ok) {
+      const body = await response.text();
+      await onLog("stderr", `[paperclip] OAuth refresh failed (${response.status}): ${body}\n`);
+      return false;
     }
 
+    const tokenData = (await response.json()) as Record<string, unknown>;
+    const newAccessToken = tokenData.access_token as string | undefined;
+    const newRefreshToken = tokenData.refresh_token as string | undefined;
+    const expiresIn = (tokenData.expires_in as number) || 3600;
+
+    if (!newAccessToken) {
+      await onLog("stderr", "[paperclip] OAuth response missing access_token.\n");
+      return false;
+    }
+
+    // Update credentials
+    const oauth = credData.claudeAiOauth as Record<string, unknown>;
+    oauth.accessToken = newAccessToken;
+    if (newRefreshToken) oauth.refreshToken = newRefreshToken;
+    oauth.expiresAt = new Date(Date.now() + expiresIn * 1000).toISOString();
+
+    const updatedJson = JSON.stringify(credData, null, 2);
+
+    // Write to all HOME locations
+    for (const dir of credDirs) {
+      const target = path.join(dir, ".claude", ".credentials.json");
+      try {
+        await fs.mkdir(path.join(dir, ".claude"), { recursive: true });
+        await fs.writeFile(target, updatedJson, { mode: 0o600 });
+      } catch {
+        // Skip dirs we cannot write to
+      }
+    }
+
+    await onLog("stderr", `[paperclip] OAuth token refreshed (expires: ${oauth.expiresAt}).\n`);
     return true;
   } catch (err) {
-    await onLog("stderr", `[paperclip] Claude token refresh command failed: ${err}\n`);
+    await onLog("stderr", `[paperclip] OAuth refresh request failed: ${err}\n`);
     return false;
   }
 }
