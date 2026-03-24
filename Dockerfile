@@ -55,7 +55,6 @@ ENV NODE_ENV=production \
 EXPOSE 3100
 
 COPY entrypoint.sh /entrypoint.sh
-COPY scripts/claude-token-refresh.sh /app/scripts/claude-token-refresh.sh
-RUN chmod +x /entrypoint.sh /app/scripts/claude-token-refresh.sh
+RUN chmod +x /entrypoint.sh
 
 CMD ["/entrypoint.sh"]
