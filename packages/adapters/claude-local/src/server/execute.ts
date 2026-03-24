@@ -29,6 +29,71 @@ import {
 } from "./parse.js";
 
 const __moduleDir = path.dirname(fileURLToPath(import.meta.url));
+
+/**
+ * Re-inject Claude credentials from CLAUDE_CREDENTIALS env var and trigger
+ * a token refresh via `claude --version`. Returns true if refresh succeeded.
+ */
+async function refreshClaudeCredentials(
+  onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>,
+): Promise<boolean> {
+  const credJson = process.env.CLAUDE_CREDENTIALS;
+  if (!credJson) {
+    await onLog("stderr", "[paperclip] CLAUDE_CREDENTIALS env var not set, cannot refresh.\n");
+    return false;
+  }
+
+  // Write credentials to all HOME locations
+  const dirs = [
+    process.env.HOME || "/paperclip",
+    "/home/node",
+    "/paperclip",
+    "/paperclip/workspace",
+  ];
+  for (const dir of dirs) {
+    const claudeDir = path.join(dir, ".claude");
+    try {
+      await fs.mkdir(claudeDir, { recursive: true });
+      await fs.writeFile(path.join(claudeDir, ".credentials.json"), credJson, { mode: 0o600 });
+    } catch {
+      // Skip dirs we cannot write to
+    }
+  }
+
+  // Trigger token refresh via claude --version
+  try {
+    const { execFile } = await import("node:child_process");
+    const { promisify } = await import("node:util");
+    const execFileAsync = promisify(execFile);
+    await execFileAsync("claude", ["--version"], {
+      env: { ...process.env, HOME: process.env.HOME || "/paperclip" },
+      timeout: 15_000,
+    });
+
+    // Sync refreshed credentials from primary HOME to other locations
+    const primaryCred = path.join(process.env.HOME || "/paperclip", ".claude", ".credentials.json");
+    try {
+      const refreshedContent = await fs.readFile(primaryCred, "utf-8");
+      for (const dir of dirs) {
+        const target = path.join(dir, ".claude", ".credentials.json");
+        if (target !== primaryCred) {
+          try {
+            await fs.writeFile(target, refreshedContent, { mode: 0o600 });
+          } catch {
+            // Skip
+          }
+        }
+      }
+    } catch {
+      // Primary file read failed, skip sync
+    }
+
+    return true;
+  } catch (err) {
+    await onLog("stderr", `[paperclip] Claude token refresh command failed: ${err}\n`);
+    return false;
+  }
+}
 const PAPERCLIP_SKILLS_CANDIDATES = [
   path.resolve(__moduleDir, "../../skills"),         // published: <pkg>/dist/server/ -> <pkg>/skills/
   path.resolve(__moduleDir, "../../../../../skills"), // dev: src/server/ -> repo root/skills/
@@ -564,6 +629,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   try {
     const initial = await runAttempt(sessionId ?? null);
+
+    // Retry on unknown session error (existing behavior)
     if (
       sessionId &&
       !initial.proc.timedOut &&
@@ -579,7 +646,27 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       return toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
     }
 
-    return toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+    // Retry on auth failure: refresh credentials from env, then retry once
+    const initialResult = toAdapterResult(initial, { fallbackSessionId: runtimeSessionId || runtime.sessionId });
+    if (initialResult.errorCode === "claude_auth_required") {
+      await onLog(
+        "stderr",
+        `[paperclip] Claude auth failed. Attempting credential refresh and retry...\n`,
+      );
+      const refreshed = await refreshClaudeCredentials(onLog);
+      if (refreshed) {
+        await onLog("stderr", `[paperclip] Credentials refreshed. Retrying heartbeat...\n`);
+        const retry = await runAttempt(null);
+        const retryResult = toAdapterResult(retry, { fallbackSessionId: null, clearSessionOnMissingSession: true });
+        if (retryResult.errorCode !== "claude_auth_required") {
+          return retryResult;
+        }
+        await onLog("stderr", `[paperclip] Retry also failed auth. Giving up.\n`);
+      }
+      return initialResult;
+    }
+
+    return initialResult;
   } finally {
     fs.rm(skillsDir, { recursive: true, force: true }).catch(() => {});
   }
